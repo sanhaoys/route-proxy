@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 import httpx
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("route_proxy")
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -16,10 +24,9 @@ from .convert_response import (
     stream_response_events,
 )
 from .proxy import (
-    passthrough_sse,
+    passthrough_stream,
     stream_and_collect,
     stream_and_forward,
-    streaming_response,
     upstream_headers,
 )
 
@@ -49,12 +56,12 @@ async def handle_responses(request: Request):
     headers = upstream_headers(request)
     client: httpx.AsyncClient = request.app.state.client
 
+    log.info("POST /v1/responses model=%s stream=%s", body.get("model"), want_stream)
+
     if want_stream:
-        return streaming_response(
-            stream_and_forward(
-                client, CC_URL, cc_body, headers,
-                converter=lambda resp: stream_response_events(resp, body),
-            )
+        return await stream_and_forward(
+            client, CC_URL, cc_body, headers,
+            converter=lambda resp: stream_response_events(resp, body),
         )
 
     return await stream_and_collect(
@@ -71,6 +78,8 @@ async def handle_chat_completions(request: Request):
     body = await request.json()
     want_stream = body.get("stream", False)
 
+    log.info("POST /v1/chat/completions model=%s stream=%s", body.get("model"), want_stream)
+
     body["stream"] = True
     body.setdefault("stream_options", {})["include_usage"] = True
 
@@ -78,9 +87,7 @@ async def handle_chat_completions(request: Request):
     client: httpx.AsyncClient = request.app.state.client
 
     if want_stream:
-        return streaming_response(
-            passthrough_sse(client, CC_URL, body, headers)
-        )
+        return await passthrough_stream(client, CC_URL, body, headers)
 
     return await stream_and_collect(
         client, CC_URL, body, headers,

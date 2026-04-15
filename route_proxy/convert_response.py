@@ -156,6 +156,8 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
     # 状态追踪
     message_added = False
     content_started = False
+    finished = False
+    completed = False
     full_content = ""
     tool_calls: dict[int, dict] = {}  # idx -> {id, name, arguments}
     tool_call_item_ids: dict[int, str] = {}  # idx -> item_id
@@ -270,7 +272,8 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                         )
 
             # ── finish ──
-            if finish_reason:
+            if finish_reason and not finished:
+                finished = True
                 for ev in _emit_close_events(
                     msg_id,
                     message_added,
@@ -283,6 +286,7 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
 
         # ── usage（最后一个 chunk） ──
         if u := chunk.get("usage"):
+            completed = True
             output_items = _build_final_output(
                 msg_id, message_added, content_started, full_content, tool_calls, tool_call_item_ids
             )
@@ -298,6 +302,32 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                     "usage": _convert_usage(u),
                 },
             )
+
+    # ── 兜底：上游未发 finish/usage 时补齐事件 ──
+    if not finished and (message_added or tool_calls):
+        for ev in _emit_close_events(
+            msg_id, message_added, content_started, full_content,
+            tool_calls, tool_call_item_ids,
+        ):
+            yield ev
+
+    if not completed:
+        output_items = _build_final_output(
+            msg_id, message_added, content_started, full_content,
+            tool_calls, tool_call_item_ids,
+        )
+        yield _sse(
+            "response.completed",
+            {
+                "id": resp_id,
+                "object": "response",
+                "created_at": now,
+                "model": model,
+                "status": "completed",
+                "output": output_items,
+                "usage": _convert_usage({}),
+            },
+        )
 
 
 def _emit_close_events(
