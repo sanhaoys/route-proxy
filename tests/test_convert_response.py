@@ -31,6 +31,22 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+def _parse_sse_events(raw_events: list[str]) -> list[tuple[str, dict]]:
+    """解析 data-only SSE 事件列表，返回 (type, data) 元组。"""
+    parsed = []
+    for raw in raw_events:
+        for part in raw.strip().split("\n\n"):
+            part = part.strip()
+            if not part:
+                continue
+            # data-only 格式：只有 data: 行
+            for line in part.split("\n"):
+                if line.startswith("data: "):
+                    data = json.loads(line[6:])
+                    parsed.append((data.get("type"), data))
+    return parsed
+
+
 # ─────── 非流式 Responses ───────
 
 
@@ -88,7 +104,8 @@ def test_collect_length_finish():
 # ─────── 流式 Responses ───────
 
 
-def test_stream_text_events():
+def test_stream_data_only_format():
+    """验证 SSE 事件是 data-only 格式，包含 type 和 sequence_number。"""
     chunks = [
         {"id": "cc-1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]},
         {"id": "cc-1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}]},
@@ -97,22 +114,25 @@ def test_stream_text_events():
     ]
     resp = FakeResponse(chunks)
 
-    events = []
+    raw_events = []
 
     async def collect():
         async for e in stream_response_events(resp, {"model": "gpt-4o"}):
-            events.append(e)
+            raw_events.append(e)
 
     _run(collect())
 
-    # 解析所有事件
-    parsed = []
-    for raw in events:
-        for part in raw.strip().split("\n\n"):
-            lines = part.strip().split("\n")
-            event_type = lines[0].replace("event: ", "")
-            data = json.loads(lines[1].replace("data: ", ""))
-            parsed.append((event_type, data))
+    # 验证同时有 event: 行和 data: 行
+    for raw in raw_events:
+        assert "event: " in raw
+        assert "data: " in raw
+
+    parsed = _parse_sse_events(raw_events)
+
+    # 所有事件都有 type 和 sequence_number
+    for event_type, data in parsed:
+        assert event_type is not None
+        assert "sequence_number" in data
 
     event_types = [e[0] for e in parsed]
 
@@ -126,14 +146,41 @@ def test_stream_text_events():
     assert "response.output_item.done" in event_types
     assert "response.completed" in event_types
 
-    # 验证 delta 内容
-    deltas = [e[1] for e in parsed if e[0] == "response.output_text.delta"]
-    assert len(deltas) == 1
-    assert deltas[0]["delta"] == "Hi"
 
-    # 验证 completed 中的 usage
-    completed = [e[1] for e in parsed if e[0] == "response.completed"][0]
-    assert completed["usage"]["input_tokens"] == 5
+def test_stream_lifecycle_events_nest_response():
+    """验证生命周期事件把 response 对象嵌套在 response 键下。"""
+    chunks = [
+        {"id": "cc-1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}]},
+        {"id": "cc-1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {"id": "cc-1", "model": "gpt-4o", "choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}},
+    ]
+    resp = FakeResponse(chunks)
+
+    raw_events = []
+
+    async def collect():
+        async for e in stream_response_events(resp, {"model": "gpt-4o"}):
+            raw_events.append(e)
+
+    _run(collect())
+    parsed = _parse_sse_events(raw_events)
+
+    # response.created 应包含 response 键
+    created = [d for t, d in parsed if t == "response.created"][0]
+    assert "response" in created
+    assert created["response"]["object"] == "response"
+    assert created["response"]["status"] == "queued"
+
+    # response.completed 应包含 response 键
+    completed = [d for t, d in parsed if t == "response.completed"][0]
+    assert "response" in completed
+    assert completed["response"]["status"] == "completed"
+    assert completed["response"]["usage"]["input_tokens"] == 5
+
+    # delta 事件不嵌套 response
+    delta = [d for t, d in parsed if t == "response.output_text.delta"][0]
+    assert "response" not in delta
+    assert delta["delta"] == "Hi"
 
 
 # ─────── CC 非流式收集 ───────

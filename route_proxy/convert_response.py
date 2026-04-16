@@ -20,8 +20,10 @@ def _gen_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:24]}"
 
 
-def _sse(event_type: str, data: dict) -> str:
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _sse(event_type: str, data: dict, seq: int) -> str:
+    """构造 SSE 事件：event 行 + data 行（type 冗余在两处）。"""
+    payload = {"type": event_type, **data, "sequence_number": seq}
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 async def parse_sse_stream(response) -> AsyncIterator[dict]:
@@ -147,11 +149,17 @@ async def collect_and_build_response(response, original_body: dict) -> dict:
 
 
 async def stream_response_events(response, original_body: dict) -> AsyncIterator[str]:
-    """将 CC stream chunk 实时转换为 Responses API 的语义化 SSE 事件流。"""
+    """将 CC stream chunk 实时转换为 Responses API 的 data-only SSE 事件流。"""
     resp_id = _gen_id("resp")
     msg_id = _gen_id("msg")
     now = time.time()
     model = original_body.get("model", "")
+    seq = 0
+
+    def next_seq() -> int:
+        nonlocal seq
+        seq += 1
+        return seq
 
     # 状态追踪
     message_added = False
@@ -159,11 +167,11 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
     finished = False
     completed = False
     full_content = ""
-    tool_calls: dict[int, dict] = {}  # idx -> {id, name, arguments}
-    tool_call_item_ids: dict[int, str] = {}  # idx -> item_id
+    tool_calls: dict[int, dict] = {}
+    tool_call_item_ids: dict[int, str] = {}
 
-    # ── response.created ──
-    base = {
+    # ── 生命周期事件：response 对象嵌套在 "response" 键下 ──
+    base_resp = {
         "id": resp_id,
         "object": "response",
         "created_at": now,
@@ -171,10 +179,10 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
         "status": "queued",
         "output": [],
     }
-    yield _sse("response.created", base)
+    yield _sse("response.created", {"response": base_resp}, next_seq())
 
-    base["status"] = "in_progress"
-    yield _sse("response.in_progress", base)
+    base_resp["status"] = "in_progress"
+    yield _sse("response.in_progress", {"response": base_resp}, next_seq())
 
     async for chunk in parse_sse_stream(response):
         model = chunk.get("model", model)
@@ -199,6 +207,7 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                                 "content": [],
                             },
                         },
+                        next_seq(),
                     )
 
                 if not content_started:
@@ -211,6 +220,7 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                             "content_index": 0,
                             "part": {"type": "output_text", "text": "", "annotations": []},
                         },
+                        next_seq(),
                     )
 
                 if content:
@@ -223,6 +233,7 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                             "content_index": 0,
                             "delta": content,
                         },
+                        next_seq(),
                     )
 
             # ── 工具调用 ──
@@ -253,6 +264,7 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                                     "status": "in_progress",
                                 },
                             },
+                            next_seq(),
                         )
 
                     if tc.get("id"):
@@ -269,18 +281,15 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
                                 "output_index": output_idx,
                                 "delta": args,
                             },
+                            next_seq(),
                         )
 
             # ── finish ──
             if finish_reason and not finished:
                 finished = True
                 for ev in _emit_close_events(
-                    msg_id,
-                    message_added,
-                    content_started,
-                    full_content,
-                    tool_calls,
-                    tool_call_item_ids,
+                    msg_id, message_added, content_started, full_content,
+                    tool_calls, tool_call_item_ids, next_seq,
                 ):
                     yield ev
 
@@ -288,26 +297,22 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
         if u := chunk.get("usage"):
             completed = True
             output_items = _build_final_output(
-                msg_id, message_added, content_started, full_content, tool_calls, tool_call_item_ids
+                msg_id, message_added, content_started, full_content,
+                tool_calls, tool_call_item_ids,
             )
-            yield _sse(
-                "response.completed",
-                {
-                    "id": resp_id,
-                    "object": "response",
-                    "created_at": now,
-                    "model": model,
-                    "status": "completed",
-                    "output": output_items,
-                    "usage": _convert_usage(u),
-                },
-            )
+            completed_resp = {
+                **base_resp,
+                "status": "completed",
+                "output": output_items,
+                "usage": _convert_usage(u),
+            }
+            yield _sse("response.completed", {"response": completed_resp}, next_seq())
 
     # ── 兜底：上游未发 finish/usage 时补齐事件 ──
     if not finished and (message_added or tool_calls):
         for ev in _emit_close_events(
             msg_id, message_added, content_started, full_content,
-            tool_calls, tool_call_item_ids,
+            tool_calls, tool_call_item_ids, next_seq,
         ):
             yield ev
 
@@ -316,18 +321,13 @@ async def stream_response_events(response, original_body: dict) -> AsyncIterator
             msg_id, message_added, content_started, full_content,
             tool_calls, tool_call_item_ids,
         )
-        yield _sse(
-            "response.completed",
-            {
-                "id": resp_id,
-                "object": "response",
-                "created_at": now,
-                "model": model,
-                "status": "completed",
-                "output": output_items,
-                "usage": _convert_usage({}),
-            },
-        )
+        completed_resp = {
+            **base_resp,
+            "status": "completed",
+            "output": output_items,
+            "usage": _convert_usage({}),
+        }
+        yield _sse("response.completed", {"response": completed_resp}, next_seq())
 
 
 def _emit_close_events(
@@ -337,11 +337,11 @@ def _emit_close_events(
     full_content: str,
     tool_calls: dict[int, dict],
     tool_call_item_ids: dict[int, str],
+    next_seq,
 ) -> list[str]:
     """生成关闭事件序列。"""
     events: list[str] = []
 
-    # 关闭文本
     if content_started:
         events.append(
             _sse(
@@ -352,6 +352,7 @@ def _emit_close_events(
                     "content_index": 0,
                     "text": full_content,
                 },
+                next_seq(),
             )
         )
         events.append(
@@ -363,6 +364,7 @@ def _emit_close_events(
                     "content_index": 0,
                     "part": {"type": "output_text", "text": full_content, "annotations": []},
                 },
+                next_seq(),
             )
         )
 
@@ -384,10 +386,10 @@ def _emit_close_events(
                         ),
                     },
                 },
+                next_seq(),
             )
         )
 
-    # 关闭工具调用
     for idx in sorted(tool_calls):
         tc = tool_calls[idx]
         item_id = tool_call_item_ids[idx]
@@ -401,6 +403,7 @@ def _emit_close_events(
                     "output_index": output_idx,
                     "arguments": tc["arguments"],
                 },
+                next_seq(),
             )
         )
         events.append(
@@ -417,6 +420,7 @@ def _emit_close_events(
                         "status": "completed",
                     },
                 },
+                next_seq(),
             )
         )
 
